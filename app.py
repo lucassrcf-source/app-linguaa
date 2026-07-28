@@ -72,8 +72,26 @@ def _fmt(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _is_block_page(content: str) -> bool:
+    t = (content or "").lower()
+    return any(
+        x in t
+        for x in (
+            "<html",
+            "<!doctype",
+            "we're sorry",
+            "automated queries",
+            "sign in to confirm",
+            "too many requests",
+            "consent.youtube",
+        )
+    )
+
+
 def _parse_vtt(content: str) -> list[dict]:
     """Converte WEBVTT em lista de cues {start,end,text}."""
+    if _is_block_page(content):
+        return []
     content = content.replace("\r\n", "\n").replace("\r", "\n")
     blocks = re.split(r"\n\s*\n", content.strip())
     cues: list[dict] = []
@@ -572,9 +590,19 @@ def captions():
     t0 = time.time()
     try:
         vtt, lang_used, is_auto = _download_vtt(video_id, lang)
-        cues = _parse_vtt(vtt)
+        if _is_block_page(vtt):
+            raise RuntimeError(
+                "YouTube bloqueou o IP (página Sorry/bot). "
+                "No app a legenda deve baixar no aparelho."
+            )
+        # transcript-api devolve SRT; yt-dlp devolve VTT
+        if "-->" in vtt and not vtt.lstrip().startswith("WEBVTT"):
+            # SRT-like: reutiliza parser VTT (mesmos timestamps)
+            cues = _parse_vtt("WEBVTT\n\n" + vtt)
+        else:
+            cues = _parse_vtt(vtt)
         if not cues:
-            raise RuntimeError("VTT vazio após parse")
+            raise RuntimeError("Legenda vazia ou inválida após parse")
     except Exception as e:
         return jsonify({"error": f"Falha ao baixar legenda: {e}"}), 502
 
