@@ -137,12 +137,7 @@ def _cues_to_srt(cues: list[dict]) -> str:
 
 def _extract_info(video_id: str) -> dict:
     url = f"https://www.youtube.com/watch?v={video_id}"
-    opts = {
-        "skip_download": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(_ydl_base_opts()) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -194,52 +189,158 @@ def _list_tracks(video_id: str) -> list[dict]:
     return tracks
 
 
+def _cookiefile() -> str | None:
+    """Caminho opcional de cookies do YouTube (anti-bot em IPs de nuvem)."""
+    for p in (
+        os.environ.get("YTDLP_COOKIES"),
+        os.environ.get("COOKIES_FILE"),
+        "/etc/secrets/cookies.txt",
+        str(Path(__file__).parent / "cookies.txt"),
+    ):
+        if p and Path(p).is_file():
+            return p
+    return None
+
+
+def _ydl_base_opts() -> dict:
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    cookies = _cookiefile()
+    if cookies:
+        opts["cookiefile"] = cookies
+    return opts
+
+
+def _download_via_transcript_api(video_id: str, lang: str) -> tuple[str, str, bool]:
+    """
+    Fallback que costuma funcionar melhor em IPs de datacenter (Render).
+    Retorna (vtt_or_srt_text, lang_used, is_auto).
+    """
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    candidates = LANG_ALIASES.get(lang.lower(), [lang])
+    if lang not in candidates:
+        candidates = [lang] + list(candidates)
+
+    api = YouTubeTranscriptApi()
+    listing = api.list(video_id)
+
+    transcript = None
+    is_auto = False
+    last_err: Exception | None = None
+
+    for code in candidates:
+        try:
+            transcript = listing.find_manually_created_transcript([code])
+            is_auto = False
+            break
+        except Exception as e:
+            last_err = e
+        try:
+            transcript = listing.find_generated_transcript([code])
+            is_auto = True
+            break
+        except Exception as e:
+            last_err = e
+        try:
+            transcript = listing.find_transcript([code])
+            is_auto = getattr(transcript, "is_generated", False)
+            break
+        except Exception as e:
+            last_err = e
+
+    if transcript is None:
+        # qualquer idioma disponível
+        try:
+            for t in listing:
+                transcript = t
+                is_auto = getattr(t, "is_generated", False)
+                break
+        except Exception as e:
+            last_err = e
+
+    if transcript is None:
+        raise RuntimeError(f"Transcript API sem legenda: {last_err}")
+
+    fetched = transcript.fetch()
+    # monta SRT simples
+    lines = []
+    for i, snip in enumerate(fetched, 1):
+        start = float(getattr(snip, "start", snip.get("start", 0) if isinstance(snip, dict) else 0))
+        dur = float(getattr(snip, "duration", snip.get("duration", 2) if isinstance(snip, dict) else 2))
+        text = getattr(snip, "text", snip.get("text", "") if isinstance(snip, dict) else "")
+        text = str(text).replace("\n", " ").strip()
+        if not text:
+            continue
+        end = start + dur
+        lines.append(str(i))
+        lines.append(f"{_fmt(start)} --> {_fmt(end)}")
+        lines.append(text)
+        lines.append("")
+    body = "\n".join(lines)
+    if not body.strip():
+        raise RuntimeError("Transcript API devolveu vazio")
+    used = getattr(transcript, "language_code", lang)
+    return body, used, is_auto
+
+
 def _download_vtt(video_id: str, lang: str) -> tuple[str, str, bool]:
     """
-    Baixa VTT com yt-dlp. Retorna (conteúdo, lang_usado, is_auto).
+    Baixa legenda. Ordem:
+    1) youtube-transcript-api (melhor em nuvem)
+    2) yt-dlp (+ cookies se existirem)
     """
+    errors: list[str] = []
+
+    try:
+        return _download_via_transcript_api(video_id, lang)
+    except Exception as e:
+        errors.append(f"transcript-api: {e}")
+
     candidates = LANG_ALIASES.get(lang.lower(), [lang])
     if lang not in candidates:
         candidates = [lang] + candidates
 
     with tempfile.TemporaryDirectory() as tmp:
         outtmpl = str(Path(tmp) / "%(id)s.%(ext)s")
+        base = _ydl_base_opts()
 
-        # 1) legenda manual
         opts = {
-            "skip_download": True,
+            **base,
             "writesubtitles": True,
             "writeautomaticsub": False,
             "subtitleslangs": candidates,
             "subtitlesformat": "vtt",
             "outtmpl": outtmpl,
-            "quiet": True,
-            "no_warnings": True,
         }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+            files = list(Path(tmp).glob("*.vtt"))
+            if files:
+                path = files[0]
+                used = path.name.split(".")[-2] if path.name.count(".") >= 2 else lang
+                return path.read_text(encoding="utf-8", errors="replace"), used, False
+        except Exception as e:
+            errors.append(f"yt-dlp manual: {e}")
 
-        files = list(Path(tmp).glob("*.vtt"))
-        if files:
-            path = files[0]
-            # tqJQkr-RNEk.en.vtt
-            used = path.name.split(".")[-2] if path.name.count(".") >= 2 else lang
-            return path.read_text(encoding="utf-8", errors="replace"), used, False
-
-        # 2) auto
         opts["writesubtitles"] = False
         opts["writeautomaticsub"] = True
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+            files = list(Path(tmp).glob("*.vtt"))
+            if files:
+                path = files[0]
+                used = path.name.split(".")[-2] if path.name.count(".") >= 2 else lang
+                return path.read_text(encoding="utf-8", errors="replace"), used, True
+        except Exception as e:
+            errors.append(f"yt-dlp auto: {e}")
 
-        files = list(Path(tmp).glob("*.vtt"))
-        if not files:
-            raise RuntimeError(
-                f"Nenhuma legenda VTT para videoId={video_id} lang={lang}"
-            )
-        path = files[0]
-        used = path.name.split(".")[-2] if path.name.count(".") >= 2 else lang
-        return path.read_text(encoding="utf-8", errors="replace"), used, True
+    raise RuntimeError(" | ".join(errors))
 
 
 @app.get("/health")
@@ -248,7 +349,8 @@ def health():
         {
             "ok": True,
             "service": "linguaplay-captions",
-            "engine": "yt-dlp",
+            "engine": "yt-dlp+transcript-api",
+            "cookies": bool(_cookiefile()),
             "cache": str(CACHE_DIR),
         }
     )
@@ -280,10 +382,8 @@ def search():
 
     try:
         opts = {
-            "quiet": True,
-            "no_warnings": True,
+            **_ydl_base_opts(),
             "extract_flat": True,
-            "skip_download": True,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{full_q}", download=False)
