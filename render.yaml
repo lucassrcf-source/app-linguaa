@@ -1,0 +1,12 @@
+# Deploy no Render: https://render.com
+# Dashboard → New → Blueprint → aponte para esta pasta/repo
+services:
+  - type: web
+    name: linguaplay-captions
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PORT
+        value: 10000
