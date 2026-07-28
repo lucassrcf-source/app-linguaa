@@ -15,6 +15,7 @@ API:
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 import time
@@ -27,8 +28,13 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-CACHE_DIR = Path(__file__).parent / "cache"
-CACHE_DIR.mkdir(exist_ok=True)
+# Em nuvem (Render) /tmp é gravável; local usa pasta do projeto
+try:
+    CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(Path(__file__).parent / "cache")))
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    CACHE_DIR = Path("/tmp/linguaplay-cache")
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 LANG_ALIASES = {
     "en": ["en", "en-US", "en-GB"],
